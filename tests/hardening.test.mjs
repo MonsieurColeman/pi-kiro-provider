@@ -226,7 +226,7 @@ test("OAuth social login uses single kiro provider id with exact state verificat
     });
 
     assert.equal(provider.id, "kiro");
-    assert.deepEqual(selectedPrompt.options.map((option) => option.id), ["builder-id", "google", "github"]);
+    assert.deepEqual(selectedPrompt.options.map((option) => option.id), ["portal", "builder-id", "google", "github"]);
     const parsedAuthUrl = new URL(authUrl);
     assert.equal(parsedAuthUrl.searchParams.get("idp"), "Google");
     assert.equal(parsedAuthUrl.searchParams.get("code_challenge_method"), "S256");

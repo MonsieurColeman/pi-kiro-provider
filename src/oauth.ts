@@ -51,6 +51,11 @@ const SOCIAL_IDP_BY_METHOD: Record<(typeof SOCIAL_AUTH_METHODS)[number], string>
   github: "Github",
 };
 const PKCE_VERIFIER_BYTES = 32;
+const PORTAL_METHOD = "portal";
+const PORTAL_PORT = 3128;
+const PORTAL_REDIRECT_URI = `http://localhost:${PORTAL_PORT}`;
+const PORTAL_CALLBACK_PATHS = ["/", "/oauth/callback", "/signin/callback"];
+const AWS_REGION_PATTERN = /^[a-z]{2}(?:-[a-z]+)+-\d$/;
 const DEFAULT_SOCIAL_PORTAL_URL = "https://app.kiro.dev/signin";
 const DEFAULT_SOCIAL_PORTAL_REDIRECT_URI = "http://localhost:3128";
 const DEFAULT_SOCIAL_CALLBACK_PATH = "/oauth/callback";
@@ -428,7 +433,16 @@ async function startLocalCallbackServer(config: KiroOAuthConfig, authMethod: (ty
   };
 }
 
-async function loginWithBuilderId(config: KiroOAuthConfig, callbacks: OAuthLoginCallbacks, logger: DebugLogger): Promise<KiroCredentials> {
+interface DeviceAuthorization {
+  client: { clientId: string; clientSecret: string };
+  deviceCode: string;
+  userCode: string;
+  verificationUrl: string;
+  expiresInSeconds: number;
+  intervalSeconds: number;
+}
+
+async function startDeviceAuthorization(config: KiroOAuthConfig): Promise<DeviceAuthorization> {
   const client = await registerClient(config);
   const device = await requestDeviceCode(config, client);
   const deviceCode = nonEmptyString(device.deviceCode);
@@ -436,14 +450,29 @@ async function loginWithBuilderId(config: KiroOAuthConfig, callbacks: OAuthLogin
   const verificationUri = nonEmptyString(device.verificationUri);
   const verificationUriComplete = nonEmptyString(device.verificationUriComplete) ?? verificationUri;
   if (!deviceCode || !userCode || !verificationUri) throw configuredKiroOAuthFailure(config, "login", "Kiro device authorization failed", { reason: "missing_required_fields", permanent: false });
+  return {
+    client,
+    deviceCode,
+    userCode,
+    verificationUrl: verificationUriComplete ?? verificationUri,
+    expiresInSeconds: numericSeconds(device.expiresIn, 600),
+    intervalSeconds: Math.max(1, numericSeconds(device.interval, 5)),
+  };
+}
 
+async function loginWithBuilderId(config: KiroOAuthConfig, callbacks: OAuthLoginCallbacks, logger: DebugLogger): Promise<KiroCredentials> {
+  const auth = await startDeviceAuthorization(config);
   callbacks.onAuth({
-    url: verificationUriComplete ?? verificationUri,
-    instructions: `Open the Kiro authorization URL and enter code ${userCode}.`,
+    url: auth.verificationUrl,
+    instructions: `Open the Kiro authorization URL and enter code ${auth.userCode}.`,
   });
+  return pollDeviceAuthorization(config, auth, callbacks, logger);
+}
 
-  const expiresIn = numericSeconds(device.expiresIn, 600);
-  const intervalMs = Math.max(1, numericSeconds(device.interval, 5)) * 1000;
+async function pollDeviceAuthorization(config: KiroOAuthConfig, auth: DeviceAuthorization, callbacks: OAuthLoginCallbacks, logger: DebugLogger): Promise<KiroCredentials> {
+  const { client, deviceCode } = auth;
+  const expiresIn = auth.expiresInSeconds;
+  const intervalMs = auth.intervalSeconds * 1000;
   const deadline = Date.now() + expiresIn * 1000;
   let nextIntervalMs = intervalMs;
 
@@ -474,12 +503,16 @@ async function loginWithBuilderId(config: KiroOAuthConfig, callbacks: OAuthLogin
   throw configuredKiroOAuthFailure(config, "login", "Kiro OAuth device code expired before authorization completed", { body: { error: "expired_token" } });
 }
 
-async function selectAuthMethod(config: KiroOAuthConfig, callbacks: OAuthLoginCallbacks): Promise<KiroAuthMethod> {
-  if (!callbacks.onSelect) return "builder-id";
+async function selectAuthMethod(config: KiroOAuthConfig, callbacks: OAuthLoginCallbacks): Promise<KiroAuthMethod | typeof PORTAL_METHOD> {
+  if (!callbacks.onSelect) return PORTAL_METHOD;
   const selected = await callbacks.onSelect({
     message: "Choose a Kiro sign-in method.",
-    options: AUTH_METHODS.map((method) => ({ id: method, label: config.methodLabels[method] })),
+    options: [
+      { id: PORTAL_METHOD, label: "Kiro sign-in page (Google, GitHub, or your organization)" },
+      ...AUTH_METHODS.map((method) => ({ id: method, label: config.methodLabels[method] })),
+    ],
   });
+  if (selected === PORTAL_METHOD) return PORTAL_METHOD;
   if (selected === undefined) {
     throw configuredKiroOAuthFailure(config, "login", "Kiro OAuth login was cancelled", { reason: "authorization_denied", permanent: true });
   }
@@ -640,8 +673,103 @@ async function loginWithSocial(config: KiroOAuthConfig, authMethod: (typeof SOCI
   }
 }
 
+
+type PortalResult =
+  | { kind: "social"; code: string; authMethod: (typeof SOCIAL_AUTH_METHODS)[number]; redirectUri: string }
+  | { kind: "idc"; config: KiroOAuthConfig; auth: DeviceAuthorization };
+
+// Mirrors pi-provider-kiro: open Kiro's own sign-in page, which offers Google, GitHub and
+// "Sign in with your organization". Social sign-ins come back with a PKCE code; organization
+// sign-ins come back with the org's start URL (issuer_url) and region (idc_region), which we
+// turn into a standard IAM Identity Center device-code login.
+async function loginWithPortal(config: KiroOAuthConfig, callbacks: OAuthLoginCallbacks, logger: DebugLogger): Promise<KiroCredentials> {
+  const providerId = nonEmptyString(config.providerId) ?? "kiro";
+  const pkce = createPkce();
+  const portalUrl = new URL(DEFAULT_SOCIAL_PORTAL_URL);
+  applyPkceParams(portalUrl, pkce.codeChallenge, pkce.state);
+  portalUrl.searchParams.set("redirect_uri", PORTAL_REDIRECT_URI);
+  portalUrl.searchParams.set("redirect_from", "kirocli");
+
+  let server: Server | undefined;
+  const result = await new Promise<PortalResult>((resolve, reject) => {
+    const fail = (error: unknown) => reject(error instanceof Error ? error : new Error(String(error)));
+    callbacks.signal?.addEventListener("abort", () => fail(callbacks.signal?.reason ?? new Error("Kiro OAuth login aborted.")), { once: true });
+
+    server = createServer(async (request, response) => {
+      try {
+        const url = new URL(request.url ?? "/", PORTAL_REDIRECT_URI);
+        if (!PORTAL_CALLBACK_PATHS.includes(url.pathname)) {
+          responseWithHtml(response, 404, LOCAL_CALLBACK_ERROR_HTML);
+          return;
+        }
+        if (url.searchParams.get("state") !== pkce.state) {
+          responseWithHtml(response, 400, LOCAL_CALLBACK_ERROR_HTML);
+          fail(classifyKiroOAuthFailure("login", "Kiro sign-in callback state did not match", { providerId, reason: "state_mismatch", permanent: true }));
+          return;
+        }
+        const error = nonEmptyString(url.searchParams.get("error"));
+        if (error) {
+          responseWithHtml(response, 400, LOCAL_CALLBACK_ERROR_HTML);
+          fail(classifyKiroOAuthFailure("login", "Kiro sign-in was denied", { providerId, body: { error } }));
+          return;
+        }
+
+        const issuerUrl = nonEmptyString(url.searchParams.get("issuer_url"));
+        if (issuerUrl) {
+          const idcRegion = nonEmptyString(url.searchParams.get("idc_region")) ?? "us-east-1";
+          if (!/^https:\/\//i.test(issuerUrl) || !AWS_REGION_PATTERN.test(idcRegion)) {
+            responseWithHtml(response, 400, LOCAL_CALLBACK_ERROR_HTML);
+            fail(classifyKiroOAuthFailure("login", "Kiro organization sign-in returned an invalid start URL or region", { providerId, reason: "invalid_callback", permanent: true }));
+            return;
+          }
+          const orgConfig: KiroOAuthConfig = { ...config, region: idcRegion, startUrl: issuerUrl, skipIssuerUrlForRegistration: true };
+          const auth = await startDeviceAuthorization(orgConfig);
+          responseWithHtml(response, 302, LOCAL_CALLBACK_SUCCESS_HTML, auth.verificationUrl);
+          resolve({ kind: "idc", config: orgConfig, auth });
+          return;
+        }
+
+        const code = nonEmptyString(url.searchParams.get("code"));
+        const loginOption = nonEmptyString(url.searchParams.get("login_option"))?.toLowerCase();
+        const authMethod = SOCIAL_AUTH_METHODS.find((method) => method === loginOption);
+        if (!code || !authMethod) {
+          responseWithHtml(response, 400, LOCAL_CALLBACK_ERROR_HTML);
+          fail(classifyKiroOAuthFailure("login", "Kiro sign-in callback was missing a code or sign-in method", { providerId, reason: "invalid_callback", permanent: true }));
+          return;
+        }
+        const redirectUri = `${PORTAL_REDIRECT_URI}${url.pathname === "/" ? "" : url.pathname}?login_option=${loginOption}`;
+        responseWithHtml(response, 200, LOCAL_CALLBACK_SUCCESS_HTML);
+        resolve({ kind: "social", code, authMethod, redirectUri });
+      } catch (error) {
+        responseWithHtml(response, 500, LOCAL_CALLBACK_ERROR_HTML);
+        fail(error);
+      }
+    });
+
+    // Bind to loopback only so the callback is not reachable from the network.
+    server.once("error", fail);
+    server.listen(PORTAL_PORT, "127.0.0.1", () => {
+      callbacks.onAuth({
+        url: portalUrl.toString(),
+        instructions: "Sign in on the Kiro page in your browser (Google, GitHub, or your organization).",
+      });
+      callbacks.onProgress?.("Waiting for Kiro sign-in...");
+    });
+  }).finally(async () => {
+    if (server) await closeServer(server).catch((error) => logger.warn("oauth_callback_server_close_failed", { provider: providerId, error }));
+  });
+
+  if (result.kind === "social") {
+    callbacks.onProgress?.("Exchanging Kiro authorization code...");
+    return exchangeSocialCode(config, result.authMethod, result.code, pkce.codeVerifier, result.redirectUri);
+  }
+  callbacks.onProgress?.(`Approve the request in your browser. If asked, your code is ${result.auth.userCode}.`);
+  return pollDeviceAuthorization(result.config, result.auth, callbacks, logger);
+}
+
 async function loginKiro(config: KiroOAuthConfig, callbacks: OAuthLoginCallbacks, logger: DebugLogger): Promise<KiroCredentials> {
   const authMethod = await selectAuthMethod(config, callbacks);
+  if (authMethod === PORTAL_METHOD) return loginWithPortal(config, callbacks, logger);
   if (authMethod === "builder-id") return loginWithBuilderId(config, callbacks, logger);
   return loginWithSocial(config, authMethod, callbacks, logger);
 }
