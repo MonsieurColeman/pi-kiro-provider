@@ -5,6 +5,7 @@ import type { OAuthCredentials, OAuthLoginCallbacks, OAuthProviderInterface } fr
 
 import type { KiroAuthMethod, KiroOAuthConfig } from "./config.js";
 import { redactSensitiveString } from "./debug-logger.js";
+import { applyDiscoveredModels, withDiscoveredCatalog, type ModelDiscoveryConfig } from "./discovery.js";
 import type { DebugLogger } from "./debug-logger.js";
 import { isRecord, nonEmptyString, type JsonRecord, positiveFiniteNumber as numericSeconds, KIRO_PROFILE_ARN_HEADER, readJsonResponse, applyProfileArnToModels, resolveOAuthProviderIdentity } from "./shared/index.js";
 
@@ -816,28 +817,41 @@ async function refreshWithSocialEndpoint(config: KiroOAuthConfig, credentials: K
 export interface KiroOAuthProviderOptions {
   providerId?: string;
   displayName?: string;
+  modelDiscovery?: ModelDiscoveryConfig;
+  profileArn?: string;
 }
 
 export function createKiroOAuthProvider(config: KiroOAuthConfig, logger: DebugLogger, options: KiroOAuthProviderOptions = {}): OAuthProviderInterface {
   const { providerId, displayName } = resolveOAuthProviderIdentity(options, config);
   const providerConfig: KiroOAuthConfig = { ...config, providerId };
+  const discovery: ModelDiscoveryConfig = options.modelDiscovery ?? { enabled: false };
   return {
     id: providerId,
     name: displayName,
     async login(callbacks) {
-      return loginKiro(providerConfig, callbacks, logger);
+      const credentials = await loginKiro(providerConfig, callbacks, logger);
+      callbacks.onProgress?.("Fetching your available Kiro models...");
+      return withDiscoveredCatalog(credentials, undefined, options.profileArn, discovery, logger, providerId);
     },
     async refreshToken(credentials) {
       const kiroCredentials = credentials as KiroCredentials;
       if (!kiroCredentials.refresh) throw classifyKiroOAuthFailure("refresh", "Kiro OAuth refresh requires a refresh token", { providerId, reason: "missing_refresh_token", permanent: true });
       const authMethod = normalizeStoredAuthMethod(kiroCredentials.authMethod);
       if (!authMethod) throw classifyKiroOAuthFailure("refresh", "Kiro OAuth credential auth method is not supported", { providerId, reason: "unsupported_auth_method", permanent: true });
-      if (authMethod === "builder-id") return refreshWithOidc(kiroCredentials, providerId, providerConfig);
-      return refreshWithSocialEndpoint(providerConfig, kiroCredentials, authMethod);
+      const refreshed = authMethod === "builder-id"
+        ? await refreshWithOidc(kiroCredentials, providerId, providerConfig)
+        : await refreshWithSocialEndpoint(providerConfig, kiroCredentials, authMethod);
+      return withDiscoveredCatalog(refreshed, kiroCredentials, options.profileArn, discovery, logger, providerId);
     },
     getApiKey(credentials) {
       return credentials.access;
     },
-    modifyModels: applyProfileArnToModels,
+    modifyModels: (models, credentials) => {
+      const withCatalog = applyDiscoveredModels(models, credentials, providerId);
+      // Stamp the profile ARN only onto this provider's models, not every provider's.
+      const ours = applyProfileArnToModels(withCatalog.filter((model) => model.provider === providerId), credentials);
+      let index = 0;
+      return withCatalog.map((model) => (model.provider === providerId ? ours[index++] : model));
+    },
   };
 }

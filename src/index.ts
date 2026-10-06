@@ -75,6 +75,8 @@ export default function kiroProviderExtension(pi: ExtensionAPI): void {
   const oauthProvider = createKiroOAuthProvider(config.oauth, logger, {
     providerId: config.providerId,
     displayName: config.displayName,
+    modelDiscovery: config.modelDiscovery,
+    profileArn: config.profileArn,
   });
   registerOAuthProvider(oauthProvider);
 

@@ -64,6 +64,7 @@ export interface ExtensionConfig {
   headers: Record<string, string>;
   models: KiroProviderModelConfig[];
   oauth: KiroOAuthConfig;
+  modelDiscovery: { enabled: boolean; origin?: string };
 }
 
 export interface ConfigLoadResult {
@@ -360,6 +361,10 @@ export function loadConfig(extensionRoot: string): ConfigLoadResult {
       headers: sanitizeHeaderConfig(stringRecordOr(raw.headers), warnings, "headers") ?? {},
       models,
       oauth: normalizeOAuthConfig(raw.oauth, numberOr(raw.requestTimeoutMs, 600_000)),
+      modelDiscovery: {
+        enabled: booleanOr(isRecord(raw.modelDiscovery) ? raw.modelDiscovery.enabled : undefined, true),
+        origin: isRecord(raw.modelDiscovery) ? optionalString(raw.modelDiscovery.origin) : undefined,
+      },
     },
     warnings,
   };
