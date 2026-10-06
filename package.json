@@ -28,8 +28,7 @@
     "test": "node scripts/run-tests.mjs",
     "check": "npm run typecheck && npm run --silent lint && npm run test && npm run build",
     "package:dry-run": "npm pack --dry-run",
-    "prepublishOnly": "npm run check",
-    "postinstall": "node -e \"const fs=require('fs'),cp=require('child_process'),p=require('path');const cwd=process.cwd();const normalized=cwd.split(p.sep).join('/');if(!normalized.includes('/.pi/agent/extensions/'))process.exit(0);const s=p.resolve(cwd,'../../scripts/patch-vulnerable-deps.mjs');if(!fs.existsSync(s))process.exit(0);const r=cp.spawnSync(process.execPath,[s,'--target',cwd,'--quiet'],{stdio:'inherit'});process.exit(r.status||0)\""
+    "prepublishOnly": "npm run check"
   },
   "keywords": [
     "pi-package",
