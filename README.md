@@ -2,23 +2,22 @@
 
 # pi-kiro-provider
 
-[![npm version](https://img.shields.io/npm/v/pi-kiro-provider?style=for-the-badge)](https://www.npmjs.com/package/pi-kiro-provider)
-[![License](https://img.shields.io/github/license/MasuRii/pi-kiro-provider?style=for-the-badge)](LICENSE)
-[![Platform](https://img.shields.io/badge/Platform-macOS%20%7C%20Linux%20%7C%20Windows-blue?style=for-the-badge)]()
 
-[![ko-fi](https://ko-fi.com/img/githubbutton_sm.svg)](https://ko-fi.com/Y8Y01PSSVR)
+<a href="https://ko-fi.com/Y8Y01PSSVR"><img src="assets/support-him.svg" alt="Support MasuRii" width="380" height="48"></a>
 
-`pi-kiro-provider` is a Pi extension that registers Kiro as a streaming AI provider backed by Kiro's AWS CodeWhisperer-compatible API and OAuth flow.
-- **Provider ID:** `kiro`
-- **npm:** https://www.npmjs.com/package/pi-kiro-provider
-- **GitHub:** https://github.com/MasuRii/pi-kiro-provider
+`pi-kiro-provider` is a Pi extension that registers Kiro as a streaming AI provider backed by Kiro's AWS CodeWhisperer-compatible API and OAuth flow. It also supports sign-in through the Kiro page (Google, GitHub, or your organization), live model discovery, and metered credit cost tracking with a `/kiro-credits` command.
+
+- **Upstream GitHub:** https://github.com/MasuRii/pi-kiro-provider
 
 </div>
 
 ## Features
 
 - Registers the Kiro provider through Pi's provider API with `authHeader: false` so credentials stay managed by the OAuth provider path.
-- Registers a Kiro OAuth provider with Builder ID, Google, and GitHub sign-in method labels.
+- Registers a Kiro OAuth provider with the Kiro sign-in page (Google, GitHub, or your organization) and AWS Builder ID sign-in method labels.
+- Discovers the available model list and profile ARN live from Kiro (`List-Available-Models`), cached in `cache/kiro-models.json` and refreshed after `modelDiscovery.ttlMs` (default 24h) on session start or OAuth refresh.
+- Meters real Kiro credits per request (`kiro_metering`) and converts to USD via `pricing.usdPerCredit`.
+- Adds the `/kiro-credits [days]` command: credits per day and model plus billing-period total.
 - Replays runtime provider registration events for `pi-multi-auth` readiness and Pi session lifecycle events.
 - Provides configurable model metadata, thinking-level mappings, prompt-caching metadata, request timeout, headers, and optional Kiro profile ARN support.
 - Drops static `Authorization` header overrides so managed OAuth credentials cannot be bypassed by config.
@@ -26,16 +25,10 @@
 
 ## Installation
 
-### npm package
-
-```bash
-pi install npm:pi-kiro-provider
-```
-
 ### Git repository
 
 ```bash
-pi install git:github.com/MasuRii/pi-kiro-provider
+pi install git:github.com/MonsieurColeman/pi-kiro-provider
 ```
 
 ### Local extension folder
@@ -48,6 +41,32 @@ Place this folder in one of Pi's extension discovery paths:
 | Project | `.pi/extensions/pi-kiro-provider` |
 
 Pi discovers the extension through the root `index.ts` entry listed in `package.json`.
+
+## Usage
+
+### Login
+Run Pi's login/model flow, pick Kiro, choose a method: "Kiro sign-in page (Google, GitHub, or your organization)" or AWS Builder ID. Complete in browser; token is stored by Pi and refreshed automatically.
+
+### Select model
+Open Pi's model selector, choose a `kiro` provider model. The list is populated from discovery after first login; the built-in list is used until then or if `modelDiscovery.enabled` is `false`.
+
+### Credits
+```text
+/kiro-credits
+/kiro-credits 30
+```
+
+```text
+Kiro credits, last 7 day(s) (at $0.04/credit)
+day         model                  reqs   credits     usd
+2026-10-07  claude-sonnet-4-5        12    1.2345   $0.0494
+billing period since 2026-10-01: 1.2345 credits, $0.0494, 12 requests
+```
+
+The command reads credits from Pi session logs under `$PI_CODING_AGENT_DIR/sessions` (default `~/.omp/agent/sessions`). Set `pricing.usdPerCredit` and `pricing.billingDay` in `config.json` for your account.
+
+### Config pointer
+See Configuration below for `modelDiscovery` and `pricing`.
 
 ## Configuration
 

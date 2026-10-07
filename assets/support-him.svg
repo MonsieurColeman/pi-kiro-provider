@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="240" height="48" viewBox="0 0 240 48" role="img" aria-labelledby="t">
+  <title id="t">SupportBtn</title>
+  <rect width="240" height="48" rx="12" fill="#0d8c2f"/>
+  <path fill="#FFFFFF" d="M28 13h17v5h3a6 6 0 0 1 0 12h-3v1a5 5 0 0 1-5 5H33a5 5 0 0 1-5-5V13Zm17 10h3a2 2 0 0 0 0-4h-3v4Zm-13 8a1 1 0 0 0 1 1h7a1 1 0 0 0 1-1v-3H32v3Z"/>
+  <text x="62" y="29.5" fill="#FFFFFF" font-family="-apple-system, Segoe UI, Helvetica, Arial, sans-serif" font-size="16" font-weight="700" textLength="130" lengthAdjust="spacingAndGlyphs">Support Masurii</text>
+</svg>

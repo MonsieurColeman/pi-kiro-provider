@@ -12,6 +12,7 @@
     "index.ts",
     "src",
     "config/config.example.json",
+    "assets/ko-fi-button.svg",
     "README.md",
     "CHANGELOG.md",
     "LICENSE"
