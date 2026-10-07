@@ -27,6 +27,10 @@ export type KiroProviderModelConfig = ProviderModelConfig & {
 
 export type KiroAuthMethod = "builder-id" | "google" | "github";
 export type KiroAuthMethodLabels = Record<KiroAuthMethod, string>;
+export const DEFAULT_DISCOVERY_ORIGIN = "KIRO_CLI";
+export const DEFAULT_DISCOVERY_TTL_MS = 86_400_000;
+// Kiro overage list price in USD per credit; override via `pricing.usdPerCredit` in config.json.
+export const DEFAULT_USD_PER_CREDIT = 0.04;
 
 export interface KiroOAuthConfig {
   providerId?: string;
@@ -64,7 +68,9 @@ export interface ExtensionConfig {
   headers: Record<string, string>;
   models: KiroProviderModelConfig[];
   oauth: KiroOAuthConfig;
-  modelDiscovery: { enabled: boolean; origin?: string };
+  modelDiscovery: { enabled: boolean; origin: string; ttlMs: number };
+  pricing: { usdPerCredit: number; billingDay: number };
+  modelDefaults: Omit<KiroProviderModelConfig, "id" | "name">;
 }
 
 export interface ConfigLoadResult {
@@ -295,9 +301,37 @@ function normalizeModel(rawModel: unknown, defaults: Omit<KiroProviderModelConfi
   return model;
 }
 
+/** Builds a model config from a raw record (e.g. a live-discovered model), applying the configured defaults. */
+export function createModelFromRaw(raw: Record<string, unknown>, defaults: Omit<KiroProviderModelConfig, "id" | "name">): KiroProviderModelConfig | null {
+  return normalizeModel(raw, defaults, [], 0);
+}
+
+/** Removes line and block comments outside of string literals so config.json may be annotated. */
+function stripJsonComments(text: string): string {
+  let out = "";
+  for (let i = 0; i < text.length; i += 1) {
+    const ch = text[i];
+    if (ch === '"') {
+      let j = i + 1;
+      while (j < text.length && text[j] !== '"') j += text[j] === "\\" ? 2 : 1;
+      out += text.slice(i, j + 1);
+      i = Math.min(j, text.length - 1);
+    } else if (ch === "/" && text[i + 1] === "/") {
+      while (i < text.length && text[i] !== "\n") i += 1;
+      out += "\n";
+    } else if (ch === "/" && text[i + 1] === "*") {
+      const end = text.indexOf("*/", i + 2);
+      i = end === -1 ? text.length : end + 1;
+    } else {
+      out += ch;
+    }
+  }
+  return out;
+}
+
 function readRawConfig(extensionRoot: string, warnings: string[]): Record<string, unknown> {
   try {
-    const parsed = JSON.parse(readFileSync(join(extensionRoot, "config.json"), "utf-8")) as unknown;
+    const parsed = JSON.parse(stripJsonComments(readFileSync(join(extensionRoot, "config.json"), "utf-8"))) as unknown;
     if (isRecord(parsed)) return parsed;
     warnings.push("config.json root must be an object; using defaults.");
   } catch (error) {
@@ -347,6 +381,8 @@ export function loadConfig(extensionRoot: string): ConfigLoadResult {
   }
 
   const upstreamUrl = stringOr(raw.upstreamUrl, "https://codewhisperer.us-east-1.amazonaws.com/generateAssistantResponse");
+  const rawDiscovery = isRecord(raw.modelDiscovery) ? raw.modelDiscovery : undefined;
+  const rawPricing = isRecord(raw.pricing) ? raw.pricing : undefined;
   return {
     config: {
       enabled: booleanOr(raw.enabled, true),
@@ -362,9 +398,15 @@ export function loadConfig(extensionRoot: string): ConfigLoadResult {
       models,
       oauth: normalizeOAuthConfig(raw.oauth, numberOr(raw.requestTimeoutMs, 600_000)),
       modelDiscovery: {
-        enabled: booleanOr(isRecord(raw.modelDiscovery) ? raw.modelDiscovery.enabled : undefined, true),
-        origin: isRecord(raw.modelDiscovery) ? optionalString(raw.modelDiscovery.origin) : undefined,
+        enabled: booleanOr(rawDiscovery?.enabled, true),
+        origin: optionalString(rawDiscovery?.origin) ?? DEFAULT_DISCOVERY_ORIGIN,
+        ttlMs: numberOr(rawDiscovery?.ttlMs, DEFAULT_DISCOVERY_TTL_MS),
       },
+      pricing: {
+        usdPerCredit: nonNegativeCostOr(rawPricing?.usdPerCredit, DEFAULT_USD_PER_CREDIT),
+        billingDay: typeof rawPricing?.billingDay === "number" && Number.isInteger(rawPricing.billingDay) && rawPricing.billingDay >= 1 && rawPricing.billingDay <= 28 ? rawPricing.billingDay : 1,
+      },
+      modelDefaults: defaults,
     },
     warnings,
   };

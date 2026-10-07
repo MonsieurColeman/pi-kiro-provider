@@ -1,21 +1,21 @@
-import type { Api, Model } from "@earendil-works/pi-ai";
-import type { OAuthCredentials } from "@earendil-works/pi-ai/oauth";
-
+import { writeCatalogCache } from "./catalog-cache.js";
+import type { KiroPromptCachingConfig, KiroProviderModelConfig } from "./config.js";
 import type { DebugLogger } from "./debug-logger.js";
 import { isRecord, nonEmptyString } from "./shared/index.js";
 
 /**
  * Model discovery: asks Kiro's management API which profile and models this account can use,
- * the same way Kiro's own clients do, and stores the result on the OAuth credentials so it is
- * persisted alongside them and refreshed whenever the token is refreshed.
+ * the same way Kiro's own clients do. The result is a provider-level catalog cached on disk
+ * (not stored on any single OAuth credential) and refreshed when stale or on login/refresh.
  *
- * Requests identify themselves honestly as this extension. The optional `origin` setting is
- * passed through only if the user configures one.
+ * Requests identify themselves honestly as this extension. The management API rejects
+ * List-Available-Models without an `origin`, so one is always sent (default `KIRO_CLI`).
  */
 
 export interface ModelDiscoveryConfig {
   enabled: boolean;
-  origin?: string;
+  origin: string;
+  ttlMs: number;
 }
 
 export interface DiscoveredKiroModel {
@@ -23,13 +23,16 @@ export interface DiscoveredKiroModel {
   name: string;
   contextWindow?: number;
   maxTokens?: number;
+  rateMultiplier?: number;
+  rateUnit?: string;
+  promptCaching?: KiroPromptCachingConfig;
 }
 
-export interface DiscoveryResult {
+export interface CatalogSnapshot {
   profileArn: string;
-  kiroModels: DiscoveredKiroModel[];
-  kiroModelsRegion: string;
-  kiroModelsFetchedAt: number;
+  region: string;
+  fetchedAt: number;
+  models: DiscoveredKiroModel[];
 }
 
 const MANAGEMENT_REGIONS = ["us-east-1", "eu-central-1"];
@@ -97,7 +100,7 @@ async function findProfileArn(accessToken: string, preferredRegion: string | und
   throw lastError instanceof Error ? lastError : new Error(`No Kiro profile found in ${regions.join(", ")}`);
 }
 
-async function listModels(accessToken: string, region: string, profileArn: string, origin: string | undefined): Promise<DiscoveredKiroModel[]> {
+async function listModels(accessToken: string, region: string, profileArn: string, origin: string): Promise<DiscoveredKiroModel[]> {
   const models: DiscoveredKiroModel[] = [];
   const seen = new Set<string>();
   let nextToken: string | undefined;
@@ -109,12 +112,23 @@ async function listModels(accessToken: string, region: string, profileArn: strin
       if (!id || id.trim() !== id || seen.has(id)) continue;
       seen.add(id);
       const limits = isRecord(raw.tokenLimits) ? raw.tokenLimits : {};
-      models.push({
+      const model: DiscoveredKiroModel = {
         id,
         name: nonEmptyString(raw.displayName) ?? nonEmptyString(raw.modelName) ?? id,
         contextWindow: positiveNumber(limits.maxInputTokens),
         maxTokens: positiveNumber(limits.maxOutputTokens),
-      });
+        rateMultiplier: positiveNumber(raw.rateMultiplier),
+        rateUnit: nonEmptyString(raw.rateUnit),
+      };
+      if (isRecord(raw.promptCaching) && typeof raw.promptCaching.supportsPromptCaching === "boolean") {
+        const promptCaching: KiroPromptCachingConfig = { supportsPromptCaching: raw.promptCaching.supportsPromptCaching };
+        const maxCheckpoints = positiveNumber(raw.promptCaching.maximumCacheCheckpointsPerRequest);
+        const minTokens = positiveNumber(raw.promptCaching.minimumTokensPerCacheCheckpoint);
+        if (maxCheckpoints !== undefined) promptCaching.maximumCacheCheckpointsPerRequest = maxCheckpoints;
+        if (minTokens !== undefined) promptCaching.minimumTokensPerCacheCheckpoint = minTokens;
+        model.promptCaching = promptCaching;
+      }
+      models.push(model);
     }
     nextToken = nonEmptyString(body.nextToken);
     if (!nextToken) break;
@@ -123,77 +137,79 @@ async function listModels(accessToken: string, region: string, profileArn: strin
   return models;
 }
 
-export async function discoverKiroCatalog(credentials: OAuthCredentials, configuredProfileArn: string | undefined, discovery: ModelDiscoveryConfig): Promise<DiscoveryResult> {
-  const accessToken = nonEmptyString(credentials.access);
-  if (!accessToken) throw new Error("Kiro model discovery requires an access token");
-  const loginRegion = nonEmptyString(credentials.region);
-  const profileArn = nonEmptyString(credentials.profileArn) ?? configuredProfileArn ?? (await findProfileArn(accessToken, loginRegion));
-  const region = regionFromProfileArn(profileArn) ?? MANAGEMENT_REGIONS[0];
-  const kiroModels = await listModels(accessToken, region, profileArn, discovery.origin);
-  return { profileArn, kiroModels, kiroModelsRegion: region, kiroModelsFetchedAt: Date.now() };
-}
-
-/** Run discovery after login/refresh; on failure keep whatever catalog the credentials already had. */
-export async function withDiscoveredCatalog<T extends OAuthCredentials>(
-  credentials: T,
-  previous: OAuthCredentials | undefined,
-  configuredProfileArn: string | undefined,
-  discovery: ModelDiscoveryConfig,
-  logger: DebugLogger,
-  providerId: string,
-): Promise<T> {
-  if (!discovery.enabled) return credentials;
+/** Region of a Kiro/CodeWhisperer upstream URL such as `https://q.us-east-1.amazonaws.com/...`. */
+export function regionFromUpstreamUrl(url: string): string | undefined {
   try {
-    const result = await discoverKiroCatalog(credentials, configuredProfileArn, discovery);
-    logger.debug("model_discovery_succeeded", { provider: providerId, region: result.kiroModelsRegion, modelCount: result.kiroModels.length });
-    return { ...credentials, ...result };
-  } catch (error) {
-    logger.warn("model_discovery_failed", { provider: providerId, error });
-    const keep = previous ?? credentials;
-    return {
-      ...credentials,
-      ...(keep.kiroModels !== undefined ? { kiroModels: keep.kiroModels, kiroModelsRegion: keep.kiroModelsRegion, kiroModelsFetchedAt: keep.kiroModelsFetchedAt } : {}),
-    };
+    const match = /^(?:q|codewhisperer)\.([a-z]{2}(?:-[a-z]+)+-\d)\.amazonaws\.com$/.exec(new URL(url).hostname);
+    return match && AWS_REGION_PATTERN.test(match[1]) ? match[1] : undefined;
+  } catch {
+    return undefined;
   }
 }
 
-function storedCatalog(credentials: OAuthCredentials): DiscoveredKiroModel[] | undefined {
-  const raw = credentials.kiroModels;
-  if (!Array.isArray(raw)) return undefined;
-  const models = raw.filter((model): model is DiscoveredKiroModel => isRecord(model) && Boolean(nonEmptyString(model.id)));
-  return models.length > 0 ? models : undefined;
+export async function discoverKiroCatalog(
+  accessToken: string,
+  options: { profileArn?: string; regionHint?: string; discovery: ModelDiscoveryConfig },
+): Promise<CatalogSnapshot> {
+  const profileArn = options.profileArn ?? (await findProfileArn(accessToken, options.regionHint));
+  const region = regionFromProfileArn(profileArn) ?? MANAGEMENT_REGIONS[0];
+  const models = await listModels(accessToken, region, profileArn, options.discovery.origin);
+  return { profileArn, region, fetchedAt: Date.now(), models };
 }
 
-// Per-model tuning that only makes sense for the specific model it was written for.
-const MODEL_SPECIFIC_FIELDS = ["thinkingLevelMap", "promptCaching", "rateMultiplier", "rateUnit", "importOwnership"] as const;
+/** Discover and cache the catalog. Never throws; on failure the existing cache stays in place. */
+export async function refreshCatalog(args: {
+  accessToken: string;
+  profileArn?: string;
+  regionHint?: string;
+  discovery: ModelDiscoveryConfig;
+  cachePath: string;
+  logger: DebugLogger;
+  providerId: string;
+}): Promise<CatalogSnapshot | undefined> {
+  if (!args.discovery.enabled) return undefined;
+  try {
+    const snapshot = await discoverKiroCatalog(args.accessToken, { profileArn: args.profileArn, regionHint: args.regionHint, discovery: args.discovery });
+    writeCatalogCache(args.cachePath, snapshot);
+    args.logger.debug("model_discovery_succeeded", { provider: args.providerId, region: snapshot.region, modelCount: snapshot.models.length });
+    return snapshot;
+  } catch (error) {
+    args.logger.warn("model_discovery_failed", { provider: args.providerId, error });
+    return undefined;
+  }
+}
+
+export function isCatalogStale(snapshot: CatalogSnapshot | undefined, ttlMs: number, configuredProfileArn: string | undefined, now = Date.now()): boolean {
+  if (!snapshot || now - snapshot.fetchedAt > ttlMs) return true;
+  return configuredProfileArn !== undefined && configuredProfileArn !== snapshot.profileArn;
+}
 
 /**
- * Replace this provider's models with the discovered catalog. Models already defined in the
- * built-in list or config.json keep their tuning; new models are cloned from a neutral template.
- * Other providers' models are left untouched.
+ * The live catalog is authoritative: the result is exactly the snapshot's models, in snapshot order.
+ * Models already defined in the built-in list or config.json keep their tuning (thinking map, cost,
+ * reasoning, input); new models get the configured defaults via `createModel`.
  */
-export function applyDiscoveredModels(models: Model<Api>[], credentials: OAuthCredentials, providerId: string): Model<Api>[] {
-  const catalog = storedCatalog(credentials);
-  if (!catalog) return models;
-  const ours = models.filter((model) => model.provider === providerId);
-  if (ours.length === 0) return models;
-
-  const template: Record<string, unknown> = { ...(ours.find((model) => model.id === "auto") ?? ours[0]) };
-  for (const field of MODEL_SPECIFIC_FIELDS) delete template[field];
-
-  const discovered = catalog.map((entry) => {
-    const existing = ours.find((model) => model.id === entry.id);
-    const base = (existing ?? template) as Model<Api>;
-    return {
-      ...base,
+export function applyDiscoveredModels(
+  models: KiroProviderModelConfig[],
+  snapshot: CatalogSnapshot | undefined,
+  createModel: (raw: Record<string, unknown>) => KiroProviderModelConfig | null,
+): KiroProviderModelConfig[] {
+  if (!snapshot || snapshot.models.length === 0) return models;
+  const result: KiroProviderModelConfig[] = [];
+  for (const entry of snapshot.models) {
+    const existing = models.find((model) => model.id === entry.id);
+    const model = createModel({
+      ...(existing ?? {}),
       id: entry.id,
       name: existing?.name ?? entry.name,
-      contextWindow: entry.contextWindow ?? base.contextWindow,
-      maxTokens: entry.maxTokens ?? base.maxTokens,
-    } as Model<Api>;
-  });
-
-  const firstIndex = models.findIndex((model) => model.provider === providerId);
-  const others = models.filter((model) => model.provider !== providerId);
-  return [...others.slice(0, firstIndex), ...discovered, ...others.slice(firstIndex)];
+      contextWindow: entry.contextWindow ?? existing?.contextWindow,
+      maxTokens: entry.maxTokens ?? existing?.maxTokens,
+      rateMultiplier: entry.rateMultiplier ?? existing?.rateMultiplier,
+      rateUnit: entry.rateUnit ?? existing?.rateUnit,
+      promptCaching: entry.promptCaching ?? existing?.promptCaching,
+      importOwnership: existing?.importOwnership ?? "model-discovery",
+    });
+    if (model) result.push(model);
+  }
+  return result;
 }

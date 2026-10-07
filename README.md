@@ -122,6 +122,11 @@ Minimal default-compatible configuration:
 | `oauth` | object | Kiro OAuth defaults | OAuth device/social sign-in endpoint configuration. |
 | `models` | array | built-in Kiro model list | Optional replacement model list. Omit to use built-in defaults. |
 | `modelDefaults` | object | built-in model defaults | Optional defaults applied to configured models. |
+| `pricing.usdPerCredit` | number | `0.04` | USD per Kiro credit. Per-request cost is the live metered credits times this rate; `0` disables metered pricing. Set it to your account's rate if it differs (`config.json` may contain `//` and `/* */` comments). |
+| `pricing.billingDay` | integer 1-28 | `1` | Day of month your Kiro billing cycle renews; `/kiro-credits` totals credits since the most recent such day. |
+| `modelDiscovery.enabled` | boolean | `true` | Fetches the live model list from Kiro and caches it in `cache/kiro-models.json`. |
+| `modelDiscovery.origin` | string | `KIRO_CLI` | `origin` sent to `List-Available-Models` (the API rejects requests without one). |
+| `modelDiscovery.ttlMs` | number | `86400000` | Age after which the cached model list is refreshed. |
 
 > Authorization headers configured in `headers`, `modelDefaults.headers`, or model-level `headers` are ignored intentionally. Kiro credentials are selected by the provider/OAuth integration.
 

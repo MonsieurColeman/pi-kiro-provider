@@ -39,6 +39,11 @@
     }
   },
   "modelDiscovery": {
-    "enabled": true
+    "enabled": true,
+    "origin": "KIRO_CLI",
+    "ttlMs": 86400000
+  },
+  "pricing": {
+    "usdPerCredit": 0.04
   }
 }

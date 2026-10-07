@@ -49,3 +49,30 @@ test("loadConfig drops cache checkpoint limits when prompt caching is explicitly
 
   assert.deepEqual(config.models[0].promptCaching, { supportsPromptCaching: false });
 });
+
+test("loadConfig defaults pricing and discovery origin, and honors overrides", () => {
+  const defaults = loadConfig(writeConfig({})).config;
+  assert.equal(defaults.pricing.usdPerCredit, 0.04);
+  assert.equal(defaults.modelDiscovery.origin, "KIRO_CLI");
+  assert.equal(defaults.modelDiscovery.ttlMs, 86_400_000);
+
+  const overridden = loadConfig(writeConfig({
+    pricing: { usdPerCredit: 0.05 },
+    modelDiscovery: { origin: "AI_EDITOR" },
+  })).config;
+  assert.equal(overridden.pricing.usdPerCredit, 0.05);
+  assert.equal(overridden.modelDiscovery.origin, "AI_EDITOR");
+});
+
+test("loadConfig accepts comments in config.json but leaves comment-like text inside strings alone", () => {
+  const dir = mkdtempSync(join(tmpdir(), "pi-kiro-provider-config-comments-"));
+  writeFileSync(join(dir, "config.json"), `{
+  // line comment
+  "displayName": "http://example/*not a comment*/", /* block */
+  "pricing": { "usdPerCredit": 0.05 } // trailing
+}`, "utf-8");
+  const { config, warnings } = loadConfig(dir);
+  assert.deepEqual(warnings, []);
+  assert.equal(config.displayName, "http://example/*not a comment*/");
+  assert.equal(config.pricing.usdPerCredit, 0.05);
+});

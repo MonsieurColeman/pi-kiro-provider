@@ -77,6 +77,7 @@ function createFakeExtensionApi() {
         handlers.push(handler);
         lifecycleHandlers.set(event, handlers);
       },
+      registerCommand() {},
       registerProvider(name, config) {
         registeredProviders.push({ name, config });
       },

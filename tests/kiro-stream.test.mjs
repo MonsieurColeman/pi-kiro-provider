@@ -99,6 +99,7 @@ test("Kiro toolUseEvent updates same-id tool calls with latest complete argument
       providerId: "kiro",
       upstreamUrl: "https://kiro.example.invalid/generate",
       requestTimeoutMs: 1_000,
+      pricing: { usdPerCredit: 0.04 },
     }, {}, createLogger())(createModel(), {
       messages: [{ role: "user", content: "find TypeScript files" }],
       tools: [{ name: "find", description: "Find files", parameters: { type: "object" } }],
@@ -138,6 +139,7 @@ test("Kiro fragmented same-id string inputs are accumulated before tool call end
       providerId: "kiro",
       upstreamUrl: "https://kiro.example.invalid/generate",
       requestTimeoutMs: 1_000,
+      pricing: { usdPerCredit: 0.04 },
     }, {}, createLogger())(createModel(), {
       messages: [{ role: "user", content: "grep tool events" }],
       tools: [{ name: "grep", description: "Search files", parameters: { type: "object" } }],
@@ -154,4 +156,38 @@ test("Kiro fragmented same-id string inputs are accumulated before tool call end
   } finally {
     globalThis.fetch = originalFetch;
   }
+});
+
+async function runMeteredStream(frames) {
+  const originalFetch = globalThis.fetch;
+  try {
+    globalThis.fetch = async () => createResponse(frames);
+    const stream = createKiroStream({
+      apiKey: "token",
+      providerId: "kiro",
+      upstreamUrl: "https://kiro.example.invalid/generate",
+      requestTimeoutMs: 1_000,
+      pricing: { usdPerCredit: 0.04 },
+    }, {}, createLogger())(createModel(), { messages: [{ role: "user", content: "hi" }] });
+    for await (const _event of stream) { /* drain */ }
+    return await stream.result();
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+}
+
+test("Kiro meteringEvent credits drive usage cost, split by token share", async () => {
+  const message = await runMeteredStream([
+    ["metricsEvent", { inputTokens: 100, outputTokens: 300 }],
+    ["meteringEvent", { usage: 0.5, unit: "credit", unitPlural: "credits" }],
+  ]);
+  const { cost } = message.usage;
+  assert.ok(Math.abs(cost.total - 0.02) < 1e-12);
+  assert.ok(Math.abs(cost.input - 0.005) < 1e-12);
+  assert.ok(Math.abs(cost.output - 0.015) < 1e-12);
+});
+
+test("Kiro stream without meteringEvent reports zero cost", async () => {
+  const message = await runMeteredStream([["metricsEvent", { inputTokens: 100, outputTokens: 300 }]]);
+  assert.equal(message.usage.cost.total, 0);
 });

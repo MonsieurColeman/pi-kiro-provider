@@ -91,6 +91,8 @@ interface KiroStreamState {
   totalContentLength: number;
   contextUsagePercentage: number;
   usage?: Usage;
+  /** Credits metered by Kiro for this request (sum of `meteringEvent` usage). */
+  credits: number;
 }
 
 interface KiroStreamingToolCall {
@@ -804,6 +806,7 @@ function handleEvent(stream: AssistantMessageEventStream, output: AssistantMessa
     return;
   }
   if (eventType === "meteringEvent") {
+    if (optionalString(payload.unit)?.toLowerCase() === "credit") state.credits += numberFrom(payload.usage);
     appendKiroMeteringDiagnostic(output, payload);
     return;
   }
@@ -826,7 +829,26 @@ function handleEvent(stream: AssistantMessageEventStream, output: AssistantMessa
   }
 }
 
-async function consumeKiroEventStream(response: Response, stream: AssistantMessageEventStream, output: AssistantMessage, model: Model<Api>, logger: DebugLogger): Promise<void> {
+/**
+ * Override token-priced cost with the live Kiro-metered amount. The total is what Kiro reported;
+ * the per-component split is only an allocation by (estimated) token share.
+ */
+function applyMeteredCost(usage: Usage, credits: number, usdPerCredit: number): void {
+  const total = credits * usdPerCredit;
+  if (!(total > 0)) return;
+  const weight = usage.input + usage.output + usage.cacheRead + usage.cacheWrite;
+  usage.cost = weight > 0
+    ? {
+        input: (total * usage.input) / weight,
+        output: (total * usage.output) / weight,
+        cacheRead: (total * usage.cacheRead) / weight,
+        cacheWrite: (total * usage.cacheWrite) / weight,
+        total,
+      }
+    : { input: 0, output: total, cacheRead: 0, cacheWrite: 0, total };
+}
+
+async function consumeKiroEventStream(response: Response, stream: AssistantMessageEventStream, output: AssistantMessage, model: Model<Api>, logger: DebugLogger, usdPerCredit: number): Promise<void> {
   if (!response.body) throw new Error("Kiro response did not include a readable body.");
   const state: KiroStreamState = {
     hasText: false,
@@ -834,6 +856,7 @@ async function consumeKiroEventStream(response: Response, stream: AssistantMessa
     toolCallsById: new Map(),
     totalContentLength: 0,
     contextUsagePercentage: 0,
+    credits: 0,
   };
   const queue = new ByteQueue();
   stream.push({ type: "start", partial: output });
@@ -858,6 +881,7 @@ async function consumeKiroEventStream(response: Response, stream: AssistantMessa
   closeTextBlock(stream, output, state);
   closeToolCalls(stream, output, state);
   output.usage = state.usage ?? estimatedUsage(model, state) ?? output.usage;
+  applyMeteredCost(output.usage, state.credits, usdPerCredit);
   output.stopReason = state.hasToolCalls ? "toolUse" : "stop";
   stream.push({ type: "done", reason: output.stopReason, message: output });
   stream.end(output);
@@ -892,7 +916,7 @@ async function executeKiroRequest(
       throw classifyKiroHttpFailure(response.status, errorPayload, credential.mode, config.providerId);
     }
 
-    await consumeKiroEventStream(response, stream, output, model, logger);
+    await consumeKiroEventStream(response, stream, output, model, logger, config.pricing.usdPerCredit);
   } catch (error) {
     const aborted = (signal?.signal.aborted ?? false) || error instanceof DOMException && error.name === "AbortError";
     output.stopReason = aborted ? "aborted" : "error";

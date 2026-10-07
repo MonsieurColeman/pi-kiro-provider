@@ -5,7 +5,6 @@ import type { OAuthCredentials, OAuthLoginCallbacks, OAuthProviderInterface } fr
 
 import type { KiroAuthMethod, KiroOAuthConfig } from "./config.js";
 import { redactSensitiveString } from "./debug-logger.js";
-import { applyDiscoveredModels, withDiscoveredCatalog, type ModelDiscoveryConfig } from "./discovery.js";
 import type { DebugLogger } from "./debug-logger.js";
 import { isRecord, nonEmptyString, type JsonRecord, positiveFiniteNumber as numericSeconds, KIRO_PROFILE_ARN_HEADER, readJsonResponse, applyProfileArnToModels, resolveOAuthProviderIdentity } from "./shared/index.js";
 
@@ -817,21 +816,22 @@ async function refreshWithSocialEndpoint(config: KiroOAuthConfig, credentials: K
 export interface KiroOAuthProviderOptions {
   providerId?: string;
   displayName?: string;
-  modelDiscovery?: ModelDiscoveryConfig;
-  profileArn?: string;
+  /** Refresh the provider-level model catalog; resolves the snapshot's profile so it can be stamped onto the credentials. */
+  refreshCatalog?: (credentials: OAuthCredentials) => Promise<{ profileArn: string } | undefined>;
 }
 
 export function createKiroOAuthProvider(config: KiroOAuthConfig, logger: DebugLogger, options: KiroOAuthProviderOptions = {}): OAuthProviderInterface {
   const { providerId, displayName } = resolveOAuthProviderIdentity(options, config);
   const providerConfig: KiroOAuthConfig = { ...config, providerId };
-  const discovery: ModelDiscoveryConfig = options.modelDiscovery ?? { enabled: false };
+  // Model catalog is provider-level (see index.ts); credentials only carry the profile ARN it was fetched for.
   return {
     id: providerId,
     name: displayName,
     async login(callbacks) {
       const credentials = await loginKiro(providerConfig, callbacks, logger);
       callbacks.onProgress?.("Fetching your available Kiro models...");
-      return withDiscoveredCatalog(credentials, undefined, options.profileArn, discovery, logger, providerId);
+      const snapshot = await options.refreshCatalog?.(credentials);
+      return snapshot ? { ...credentials, profileArn: snapshot.profileArn } : credentials;
     },
     async refreshToken(credentials) {
       const kiroCredentials = credentials as KiroCredentials;
@@ -841,17 +841,17 @@ export function createKiroOAuthProvider(config: KiroOAuthConfig, logger: DebugLo
       const refreshed = authMethod === "builder-id"
         ? await refreshWithOidc(kiroCredentials, providerId, providerConfig)
         : await refreshWithSocialEndpoint(providerConfig, kiroCredentials, authMethod);
-      return withDiscoveredCatalog(refreshed, kiroCredentials, options.profileArn, discovery, logger, providerId);
+      const snapshot = await options.refreshCatalog?.(refreshed);
+      return snapshot ? { ...refreshed, profileArn: snapshot.profileArn } : refreshed;
     },
     getApiKey(credentials) {
       return credentials.access;
     },
     modifyModels: (models, credentials) => {
-      const withCatalog = applyDiscoveredModels(models, credentials, providerId);
       // Stamp the profile ARN only onto this provider's models, not every provider's.
-      const ours = applyProfileArnToModels(withCatalog.filter((model) => model.provider === providerId), credentials);
+      const ours = applyProfileArnToModels(models.filter((model) => model.provider === providerId), credentials);
       let index = 0;
-      return withCatalog.map((model) => (model.provider === providerId ? ours[index++] : model));
+      return models.map((model) => (model.provider === providerId ? ours[index++] : model));
     },
   };
 }
