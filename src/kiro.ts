@@ -162,6 +162,14 @@ function textFromContent(content: string | (TextContent | ImageContent)[], optio
   return options?.pruneKiroCliScaffolding ? pruneKiroCliPromptScaffolding(text) : text;
 }
 
+/** omp injects `developer` messages (system reminders, advisor notes, file mentions); upstream pi-ai types do not model them. */
+function developerMessageText(message: unknown): string | undefined {
+  if (!isRecord(message) || message.role !== "developer") return undefined;
+  const { content } = message;
+  if (typeof content === "string") return content;
+  return Array.isArray(content) ? textFromContent(content as (TextContent | ImageContent)[]) : undefined;
+}
+
 function parseToolInput(value: unknown): Record<string, unknown> {
   if (isRecord(value)) return value;
   if (typeof value !== "string") return {};
@@ -257,7 +265,6 @@ function convertMessages(context: Context, modelId: string): { history: KiroConv
   let pendingUserContent: string[] = [];
   let pendingToolResults: KiroToolResult[] = [];
   let currentRole: "user" | "assistant" | null = null;
-  let currentMessage: KiroUserInputMessage | null = null;
   let skippedKiroCliInstruction = false;
 
   const flushUser = (): void => {
@@ -265,7 +272,6 @@ function convertMessages(context: Context, modelId: string): { history: KiroConv
     if (pendingToolResults.length > 0) userContext.toolResults = pendingToolResults;
     const message = makeUserMessage(pendingUserContent.join("\n\n"), modelId, userContext);
     history.push(message);
-    currentMessage = message;
     pendingUserContent = [];
     pendingToolResults = [];
   };
@@ -276,6 +282,16 @@ function convertMessages(context: Context, modelId: string): { history: KiroConv
   };
 
   for (const message of context.messages) {
+    const developerText = developerMessageText(message);
+    if (developerText !== undefined) {
+      const trimmed = developerText.trim();
+      if (!trimmed) continue;
+      if (currentRole !== "user") flushRole();
+      currentRole = "user";
+      pendingUserContent.push(trimmed);
+      continue;
+    }
+
     if (message.role === "user") {
       const userContent = textFromContent(message.content, { pruneKiroCliScaffolding: true });
       if (!userContent) {
@@ -317,13 +333,9 @@ function convertMessages(context: Context, modelId: string): { history: KiroConv
 
   flushRole();
 
-  if (history.length > 0 && "userInputMessage" in history[history.length - 1]) {
-    currentMessage = history.pop() as KiroUserInputMessage;
-  }
-
-  if (!currentMessage) {
-    currentMessage = makeUserMessage("Continue", modelId);
-  }
+  const lastItem = history[history.length - 1];
+  const currentMessage: KiroUserInputMessage =
+    lastItem && "userInputMessage" in lastItem ? (history.pop() as KiroUserInputMessage) : makeUserMessage("Continue", modelId);
 
   const currentContext = currentMessage.userInputMessage.userInputMessageContext ?? {};
   if (tools && tools.length > 0) currentContext.tools = tools;

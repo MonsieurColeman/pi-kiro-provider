@@ -191,3 +191,71 @@ test("Kiro stream without meteringEvent reports zero cost", async () => {
   const message = await runMeteredStream([["metricsEvent", { inputTokens: 100, outputTokens: 300 }]]);
   assert.equal(message.usage.cost.total, 0);
 });
+
+async function captureConversationState(messages) {
+  const originalFetch = globalThis.fetch;
+  let body;
+  try {
+    globalThis.fetch = async (_url, init) => {
+      body = JSON.parse(init.body);
+      return createResponse([["metricsEvent", { inputTokens: 1, outputTokens: 1 }]]);
+    };
+    const stream = createKiroStream({
+      apiKey: "token",
+      providerId: "kiro",
+      upstreamUrl: "https://kiro.example.invalid/generate",
+      requestTimeoutMs: 1_000,
+      pricing: { usdPerCredit: 0.04 },
+    }, {}, createLogger())(createModel(), { messages });
+    for await (const _event of stream) { /* drain */ }
+    return body.conversationState;
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+}
+
+const assistantText = (text) => ({ role: "assistant", content: [{ type: "text", text }], model: "kiro-test", timestamp: 1 });
+
+test("Kiro trailing developer message after assistant stop becomes the current user turn", async () => {
+  const state = await captureConversationState([
+    { role: "user", content: "do it" },
+    assistantText("done"),
+    { role: "developer", content: [{ type: "text", text: "<system-reminder>keep going</system-reminder>" }] },
+  ]);
+  assert.equal(state.history.length, 2);
+  assert.ok("assistantResponseMessage" in state.history[1]);
+  assert.equal(state.currentMessage.userInputMessage.content, "<system-reminder>keep going</system-reminder>");
+});
+
+test("Kiro developer message after tool results merges into the pending user turn", async () => {
+  const state = await captureConversationState([
+    { role: "user", content: "run it" },
+    { role: "assistant", content: [{ type: "toolCall", id: "t1", name: "find", arguments: {} }], model: "kiro-test", timestamp: 1 },
+    { role: "toolResult", toolCallId: "t1", toolName: "find", content: [{ type: "text", text: "ok" }], isError: false },
+    { role: "developer", content: "note" },
+  ]);
+  assert.equal(state.history.length, 2);
+  assert.ok("userInputMessage" in state.history[0]);
+  assert.ok("assistantResponseMessage" in state.history[1]);
+  const current = state.currentMessage.userInputMessage;
+  assert.equal(current.userInputMessageContext.toolResults[0].toolUseId, "t1");
+  assert.equal(current.content, "note");
+});
+
+test("Kiro context ending with an assistant message sends a Continue turn instead of duplicating history", async () => {
+  const state = await captureConversationState([
+    { role: "user", content: "hi" },
+    assistantText("hello"),
+  ]);
+  assert.equal(state.history.length, 2);
+  assert.equal(state.currentMessage.userInputMessage.content, "Continue");
+});
+
+test("Kiro leading developer message is not dropped", async () => {
+  const state = await captureConversationState([
+    { role: "developer", content: "ctx" },
+    { role: "user", content: "go" },
+  ]);
+  assert.equal(state.history.length, 0);
+  assert.equal(state.currentMessage.userInputMessage.content, "ctx\n\ngo");
+});
