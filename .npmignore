@@ -16,3 +16,4 @@ coverage
 tests
 *.tmp
 .DS_Store
+cache/
